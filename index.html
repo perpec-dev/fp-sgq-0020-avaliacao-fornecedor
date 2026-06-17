@@ -12,8 +12,16 @@
 <!-- ============================================================= -->
 <script>
   const CONFIG = {
-    // Cole aqui a URL do webhook do Make (cenário Monday.com)
-    WEBHOOK_URL: "https://hook.us2.make.com/s0auqaxfdcxd4udgehn8gnceqk7r6z7w",
+    // POST 1 — dados textuais (JSON leve, sem arquivos).
+    // No Make: recebe JSON → cria item no Monday.com.
+    WEBHOOK_URL: "",
+
+    // POST 2 — arquivos individuais (multipart/form-data).
+    // No Make: recebe cada arquivo + campo "protocolo" → anexa ao item do Monday.
+    // Pode ser o mesmo webhook ou um cenário separado.
+    // Deixe vazio ("") para desativar o envio de arquivos (PDF ainda será baixado localmente).
+    WEBHOOK_ARQUIVOS_URL: "",
+
     // Fontes de dados opcionais no repositório Git. Se ausentes,
     // o portal usa os bancos embutidos mais abaixo (fallback).
     PERGUNTAS_CSV_URL: "perguntas.csv",
@@ -958,52 +966,90 @@ function coletar(){
   };
 }
 
-/* arquivo -> base64 (para o payload do Make) */
-function toB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=rej;r.readAsDataURL(file);});}
-async function coletarArquivos(pdfBlob){
-  const arr=[];
-  const push=async(campo,file)=>{if(file)arr.push({campo,nome:file.name,tipo:file.type||'application/octet-stream',base64:await toB64(file)});};
-  await push('Cartão CNPJ',arquivoCNPJ);
-  await push('Certificado SGQ',arquivoCert);
-  const blocos=blocosVisiveis();
-  for(const b of blocos)for(const p of b.perguntas){const r=respostas[qid(b.id,p.c)];if(r&&r.file)await push('Evidência '+p.c,r.file);}
-  if(pdfBlob){const b64=await new Promise(res=>{const fr=new FileReader();fr.onload=()=>res(fr.result.split(',')[1]);fr.readAsDataURL(pdfBlob);});
-    arr.push({campo:'Relatório PDF',nome:'Autoavaliacao-AF-'+protocolo+'.pdf',tipo:'application/pdf',base64:b64});}
-  return arr;
+/* ================================================================
+   ENVIO — estratégia em dois POSTs para evitar payload grande
+   ----------------------------------------------------------------
+   POST 1 → WEBHOOK_URL        : JSON leve (só texto, sem arquivos)
+   POST 2 → WEBHOOK_ARQUIVOS_URL: um fetch por arquivo (multipart)
+                                   cada requisição carrega o campo
+                                   "protocolo" para vincular ao item
+   ================================================================ */
+
+/* Envia UM arquivo como multipart/form-data para o Make.
+   O Make recebe: file (o arquivo), campo (rótulo), protocolo. */
+async function enviarArquivo(url, campo, file, prot){
+  const fd = new FormData();
+  fd.append('protocolo', prot);
+  fd.append('campo', campo);
+  fd.append('file', file, file.name);
+  await fetch(url, { method:'POST', mode:'no-cors', body: fd });
 }
 
-/* ================================================================
-   ENVIO
-   ================================================================ */
 async function enviar(){
-  const erros=validar();
-  if(erros.length){showToast('Pendências:\n• '+erros.slice(0,6).join('\n• ')+(erros.length>6?'\n  …e mais '+(erros.length-6):''),'error');return;}
-  const btn=document.getElementById('btnEnviar'); btn.disabled=true; btn.textContent='⏳ Enviando...';
-  try{
-    const pdfBlob=await gerarPDF(true); // gera e baixa, retorna blob
-    const dados=coletar();
+  const erros = validar();
+  if(erros.length){
+    showToast('Pendências:\n• '+erros.slice(0,6).join('\n• ')+(erros.length>6?'\n  …e mais '+(erros.length-6):''), 'error');
+    return;
+  }
+  const btn = document.getElementById('btnEnviar');
+  btn.disabled = true; btn.textContent = '⏳ Enviando...';
+
+  try {
+    // ---- 1. Gera PDF e baixa localmente ----
+    const pdfBlob = await gerarPDF(true);
+
+    // ---- 2. POST 1: dados textuais (JSON leve, sem arquivos) ----
+    const dados = coletar();
+    // Informa ao Make quais arquivos virão no POST 2 (para ele saber o que esperar)
+    const arquivosEsperados = [];
+    if(arquivoCNPJ)  arquivosEsperados.push({campo:'Cartão CNPJ',    nome: arquivoCNPJ.name});
+    if(arquivoCert)  arquivosEsperados.push({campo:'Certificado SGQ', nome: arquivoCert.name});
+    blocosVisiveis().forEach(b=>b.perguntas.forEach(p=>{
+      const r=respostas[qid(b.id,p.c)];
+      if(r&&r.file) arquivosEsperados.push({campo:'Evidência '+p.c, nome:r.file.name});
+    }));
+    arquivosEsperados.push({campo:'Relatório PDF', nome:'Autoavaliacao-AF-'+protocolo+'.pdf'});
+    dados.arquivos_esperados = arquivosEsperados;
+
     if(CONFIG.WEBHOOK_URL){
-      dados.arquivos=await coletarArquivos(pdfBlob);
-      
-      const response = await fetch(CONFIG.WEBHOOK_URL, {
-        method: 'POST',
-        mode: 'no-cors', // Tenta contornar bloqueios de CORS simples
-        headers: { 'Content-Type': 'application/json' },
+      await fetch(CONFIG.WEBHOOK_URL, {
+        method:'POST', mode:'no-cors',
+        headers:{'Content-Type':'application/json'},
         body: JSON.stringify(dados)
       });
-
-      // Nota: Com 'no-cors', o status da resposta não é acessível (opaque), 
-      // mas o navegador envia os dados. Se você precisar de confirmação,
-      // o webhook do Make deve estar configurado para aceitar CORS.
-      showToast('Tentativa de envio concluída.\nVerifique se os dados chegaram no Make.','success');
-    }else{
-      showToast('PDF gerado localmente.\n(Webhook do Make não configurado)','success');
     }
-  }catch(e){
-    console.error("Erro no envio:", e);
-    showToast('Erro ao enviar: ' + e.message + '\nVerifique sua conexão ou o tamanho dos arquivos.','error');
+
+    // ---- 3. POST 2: cada arquivo em uma requisição multipart separada ----
+    if(CONFIG.WEBHOOK_ARQUIVOS_URL){
+      const prot = 'AF-' + protocolo;
+      const url  = CONFIG.WEBHOOK_ARQUIVOS_URL;
+      // Arquivos de identificação
+      if(arquivoCNPJ) await enviarArquivo(url, 'Cartão CNPJ',    arquivoCNPJ, prot);
+      if(arquivoCert) await enviarArquivo(url, 'Certificado SGQ', arquivoCert, prot);
+      // Evidências das perguntas
+      for(const b of blocosVisiveis())
+        for(const p of b.perguntas){
+          const r = respostas[qid(b.id,p.c)];
+          if(r && r.file) await enviarArquivo(url, 'Evidência '+p.c, r.file, prot);
+        }
+      // PDF como File (blob → File)
+      const pdfFile = new File([pdfBlob], 'Autoavaliacao-AF-'+protocolo+'.pdf', {type:'application/pdf'});
+      await enviarArquivo(url, 'Relatório PDF', pdfFile, prot);
+    }
+
+    // ---- 4. Feedback ----
+    if(CONFIG.WEBHOOK_URL || CONFIG.WEBHOOK_ARQUIVOS_URL){
+      showToast('Autoavaliação enviada com sucesso!', 'success');
+    } else {
+      showToast('PDF gerado localmente.\n(Webhooks não configurados em CONFIG)', 'success');
+    }
+
+  } catch(e){
+    console.error('Erro no envio:', e);
+    showToast('Erro ao enviar: ' + (e.message||e), 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = '⬆ Enviar Autoavaliação';
   }
-  finally{btn.disabled=false; btn.textContent='⬆ Enviar Autoavaliação';}
 }
 
 /* ================================================================
