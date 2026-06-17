@@ -13,7 +13,7 @@
 <script>
   const CONFIG = {
     // Cole aqui a URL do webhook do Make (cenário Monday.com)
-    WEBHOOK_URL: "https://hook.us2.make.com/s0auqaxfdcxd4udgehn8gnceqk7r6z7w",
+    WEBHOOK_URL: "",
     // Fontes de dados opcionais no repositório Git. Se ausentes,
     // o portal usa os bancos embutidos mais abaixo (fallback).
     PERGUNTAS_CSV_URL: "perguntas.csv",
@@ -984,12 +984,25 @@ async function enviar(){
     const dados=coletar();
     if(CONFIG.WEBHOOK_URL){
       dados.arquivos=await coletarArquivos(pdfBlob);
-      await fetch(CONFIG.WEBHOOK_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(dados)});
-      showToast('Autoavaliação enviada com sucesso!','success');
+      
+      const response = await fetch(CONFIG.WEBHOOK_URL, {
+        method: 'POST',
+        mode: 'no-cors', // Tenta contornar bloqueios de CORS simples
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dados)
+      });
+
+      // Nota: Com 'no-cors', o status da resposta não é acessível (opaque), 
+      // mas o navegador envia os dados. Se você precisar de confirmação,
+      // o webhook do Make deve estar configurado para aceitar CORS.
+      showToast('Tentativa de envio concluída.\nVerifique se os dados chegaram no Make.','success');
     }else{
-      showToast('PDF gerado. (Webhook do Make não configurado em CONFIG.WEBHOOK_URL)','success');
+      showToast('PDF gerado localmente.\n(Webhook do Make não configurado)','success');
     }
-  }catch(e){showToast('Erro ao enviar: '+e,'error');}
+  }catch(e){
+    console.error("Erro no envio:", e);
+    showToast('Erro ao enviar: ' + e.message + '\nVerifique sua conexão ou o tamanho dos arquivos.','error');
+  }
   finally{btn.disabled=false; btn.textContent='⬆ Enviar Autoavaliação';}
 }
 
