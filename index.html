@@ -14,13 +14,13 @@
   const CONFIG = {
     // POST 1 — dados textuais (JSON leve, sem arquivos).
     // No Make: recebe JSON → cria item no Monday.com.
-    WEBHOOK_URL: "",
+    WEBHOOK_URL: "https://hook.us2.make.com/s0auqaxfdcxd4udgehn8gnceqk7r6z7w",
 
     // POST 2 — arquivos individuais (multipart/form-data).
     // No Make: recebe cada arquivo + campo "protocolo" → anexa ao item do Monday.
     // Pode ser o mesmo webhook ou um cenário separado.
     // Deixe vazio ("") para desativar o envio de arquivos (PDF ainda será baixado localmente).
-    WEBHOOK_ARQUIVOS_URL: "",
+    WEBHOOK_ARQUIVOS_URL: "https://hook.us2.make.com/i836n3rnrarqg1xvo3d549azmxkllza1",
 
     // Fontes de dados opcionais no repositório Git. Se ausentes,
     // o portal usa os bancos embutidos mais abaixo (fallback).
