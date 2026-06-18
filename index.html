@@ -12,16 +12,21 @@
 <!-- ============================================================= -->
 <script>
   const CONFIG = {
-    // URL única do webhook Make — recebe tudo num multipart/form-data.
-    // O Make consegue ler o campo "dados" (JSON) e os arquivos no mesmo módulo.
-    WEBHOOK_URL: "https://hook.us2.make.com/s0auqaxfdcxd4udgehn8gnceqk7r6z7w",
+    // Webhook do Make — recebe APENAS o JSON (dados + URLs dos arquivos).
+    // Payload minúsculo: sem binário, sem corrida, sem "content too large".
+    WEBHOOK_URL: "",
 
-    // ---- Robustez de envio de arquivos ----
-    MAX_REQUEST_MB: 4,    // teto POR requisição (conservador p/ caber no webhook do Make).
-    MAX_FILE_MB:    8,    // alerta se um único arquivo passar disso (após compressão).
-    ENVIO_DELAY_MS: 2000, // pausa após enviar os dados (dá tempo do Make criar o item).
-    IMG_MAX_PX:     1800, // redimensiona imagens grandes (maior lado) antes de anexar.
-    IMG_QUALITY:    0.72, // qualidade JPEG da recompressão de imagens.
+    // ---- Cloudinary (armazenamento dos arquivos) ----
+    // O navegador sobe os arquivos direto na Cloudinary (upload "unsigned")
+    // e envia ao Make só as URLs. Preencha com os seus dados:
+    CLOUDINARY_CLOUD:  "dqodtc2yf",   // ex.: "perpec" (Cloud name do painel da Cloudinary)
+    CLOUDINARY_PRESET: "kztvojhn",   // nome do "Upload preset" UNSIGNED criado na Cloudinary
+    CLOUDINARY_FOLDER: "autoavaliacoes", // pasta onde os arquivos ficam organizados
+
+    // ---- Compressão de imagens (reduz upload e armazenamento) ----
+    MAX_FILE_MB: 15,    // alerta se um único arquivo passar disso (após compressão).
+    IMG_MAX_PX:  1800,  // redimensiona imagens grandes (maior lado) antes de subir.
+    IMG_QUALITY: 0.72,  // qualidade JPEG da recompressão de imagens.
 
     // Fontes de dados opcionais no repositório Git. Se ausentes,
     // o portal usa os bancos embutidos mais abaixo (fallback).
@@ -961,16 +966,11 @@ function atualizar(){
     rct.textContent=f.label+' — '+r.respondidas+'/'+r.total+' respondidas';
   }
 
-  // info de anexos (quantidade + tamanho total + aviso de fatiamento)
+  // info de anexos (quantidade + tamanho total)
   const ininfo=document.getElementById('anexosInfo');
   if(ininfo){
     const lista=listarArquivos(); let tot=0; lista.forEach(a=>tot+=a.file.size);
-    if(lista.length===0){ininfo.textContent='';}
-    else{
-      const lotes=Math.max(1,Math.ceil(tot/(CONFIG.MAX_REQUEST_MB*1048576)));
-      ininfo.innerHTML='📎 '+lista.length+' anexo(s) · '+fmtMB(tot)
-        + (lotes>1?' · <strong style="color:var(--yellow)">será enviado em '+lotes+' lotes</strong>':'');
-    }
+    ininfo.innerHTML = lista.length===0 ? '' : ('📎 '+lista.length+' anexo(s) · '+fmtMB(tot)+' (enviados ao subir)');
   }
 }
 
@@ -1038,55 +1038,44 @@ function coletar(){
 }
 
 /* ================================================================
-   ENVIO — dados primeiro (leve), depois arquivos em lotes pequenos
+   ENVIO — arquivos vão para a Cloudinary; ao Make vai só o JSON+URLs
    ----------------------------------------------------------------
-   Evita o erro "content too large": a requisição que cria o item
-   não carrega arquivos, e os arquivos vão em lotes ≤ MAX_REQUEST_MB.
-     • Req 1   : "dados" (JSON) + protocolo            → cria o item
-     • Req 2..N: protocolo + alguns arquivos (≤ teto)  → anexa ao item
-   Tudo amarrado pelo protocolo → 1 cenário (Router) no Make.
+   1) Cada arquivo sobe direto para a Cloudinary (upload unsigned).
+   2) Coletamos as URLs.
+   3) UM POST leve ao Make: dados + lista de {campo, nome, url}.
+   → Sem binário no webhook: sem "content too large", sem corrida.
    Nunca falha em silêncio: o PDF é sempre baixado e há resumo final.
    ================================================================ */
 
 const pausa = ms => new Promise(r=>setTimeout(r,ms));
 
-/* Monta os lotes respeitando o teto de MAX_REQUEST_MB.
-   Um arquivo isolado maior que o teto vira um lote sozinho (tenta mesmo assim). */
-function montarLotes(arquivos){
-  const teto=CONFIG.MAX_REQUEST_MB*1048576;
-  const lotes=[]; let atual=[], soma=0;
-  for(const a of arquivos){
-    const sz=a.file.size;
-    if(atual.length && soma+sz>teto){lotes.push(atual);atual=[];soma=0;}
-    atual.push(a); soma+=sz;
-  }
-  if(atual.length) lotes.push(atual);
-  return lotes;
-}
-
-/* Envia uma requisição multipart. Faz 1 retry automático.
-   - dadosJSON presente → requisição que cria o item (sem arquivos)
-   - arquivos presente   → requisição de anexos (mesmo nome "file" = array) */
-async function enviarRequisicao(arquivos, dadosJSON, prot){
-  const fd=new FormData();
-  fd.append('protocolo', prot);
-  if(dadosJSON) fd.append('dados', dadosJSON);
-  (arquivos||[]).forEach(a=>{
-    fd.append('file', a.file, a.file.name); // nome repetido → Make trata como array
-    fd.append('campo', a.campo);
-  });
-  fd.append('qtd_arquivos', String((arquivos||[]).length));
+/* Sobe um arquivo para a Cloudinary (unsigned) e devolve a URL segura.
+   resource_type "auto" → trata imagem, PDF e documentos. 1 retry. */
+async function uploadCloudinary(file){
+  const url='https://api.cloudinary.com/v1_1/'+CONFIG.CLOUDINARY_CLOUD+'/auto/upload';
   for(let tent=1; tent<=2; tent++){
-    try{ await fetch(CONFIG.WEBHOOK_URL,{method:'POST',mode:'no-cors',body:fd}); return true; }
-    catch(e){ if(tent===2){console.error('Falha na requisição:',e); return false;} await pausa(1200); }
+    try{
+      const fd=new FormData();
+      fd.append('file', file);
+      fd.append('upload_preset', CONFIG.CLOUDINARY_PRESET);
+      if(CONFIG.CLOUDINARY_FOLDER) fd.append('folder', CONFIG.CLOUDINARY_FOLDER);
+      const res=await fetch(url,{method:'POST',body:fd});
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const j=await res.json();
+      return j.secure_url || j.url;
+    }catch(e){ if(tent===2){console.error('Falha Cloudinary:',file.name,e); return null;} await pausa(1000); }
   }
-  return false;
+  return null;
 }
 
 async function enviar(){
   const erros=validar();
   if(erros.length){
     showToast('Pendências:\n• '+erros.slice(0,6).join('\n• ')+(erros.length>6?'\n  …e mais '+(erros.length-6):''),'error');
+    return;
+  }
+  if(!CONFIG.CLOUDINARY_CLOUD || !CONFIG.CLOUDINARY_PRESET){
+    showToast('Configuração pendente: defina CLOUDINARY_CLOUD e CLOUDINARY_PRESET no topo do arquivo.','error');
     return;
   }
   const btn=document.getElementById('btnEnviar'); btn.disabled=true; btn.textContent='⏳ Gerando PDF...';
@@ -1096,42 +1085,45 @@ async function enviar(){
     const pdfBlob=await gerarPDF(true);
     const pdfFile=new File([pdfBlob],'Autoavaliacao-AF-'+protocolo+'.pdf',{type:'application/pdf'});
 
-    // 2) Dados + manifesto (lista do que deve chegar → reconciliação no Monday)
-    const dados=coletar();
+    // 2) Lista de arquivos (evidências + CNPJ + cert + PDF)
     const arquivos=listarArquivos();
     arquivos.push({campo:'Relatório PDF', file:pdfFile});
-    dados.manifesto=arquivos.map(a=>({campo:a.campo, nome:a.file.name, tamanho_bytes:a.file.size}));
-    dados.total_arquivos=arquivos.length;
-    const dadosJSON=JSON.stringify(dados);
-    const prot='AF-'+protocolo;
 
-    if(!CONFIG.WEBHOOK_URL){
-      showToast('PDF gerado localmente.\n(Webhook não configurado em CONFIG.WEBHOOK_URL)','success');
-      return;
+    // 3) Sobe cada arquivo para a Cloudinary, coletando as URLs
+    const enviados=[]; const falhas=[];
+    for(let i=0;i<arquivos.length;i++){
+      btn.textContent='⏳ Subindo arquivo '+(i+1)+'/'+arquivos.length+'...';
+      const a=arquivos[i];
+      const url=await uploadCloudinary(a.file);
+      if(url) enviados.push({campo:a.campo, nome:a.file.name, url:url, tamanho_bytes:a.file.size});
+      else    falhas.push(a.campo);
     }
 
-    // 3) Requisição 1 — só os dados (cria o item, sem arquivos)
-    btn.textContent='⏳ Enviando dados...';
-    const okDados=await enviarRequisicao([], dadosJSON, prot);
-    await pausa(CONFIG.ENVIO_DELAY_MS); // tempo para o Make criar o item
+    // 4) Monta os dados com as URLs e manda UM POST leve ao Make
+    const dados=coletar();
+    dados.arquivos=enviados;          // [{campo, nome, url, tamanho_bytes}]
+    dados.total_arquivos=enviados.length;
+    const prot='AF-'+protocolo;
 
-    // 4) Requisições de arquivos em lotes pequenos
-    const lotes=montarLotes(arquivos);
-    let okCount=0; const falhas=[];
-    for(let i=0;i<lotes.length;i++){
-      btn.textContent='⏳ Enviando arquivos '+(i+1)+'/'+lotes.length+'...';
-      const ok=await enviarRequisicao(lotes[i], null, prot);
-      if(ok){ okCount+=lotes[i].length; } else { lotes[i].forEach(a=>falhas.push(a.campo)); }
-      if(i<lotes.length-1) await pausa(700);
+    let okWebhook=true;
+    if(CONFIG.WEBHOOK_URL){
+      btn.textContent='⏳ Enviando ao Make...';
+      const fd=new FormData();
+      fd.append('protocolo', prot);
+      fd.append('dados', JSON.stringify(dados));
+      try{ await fetch(CONFIG.WEBHOOK_URL,{method:'POST',mode:'no-cors',body:fd}); }
+      catch(e){ okWebhook=false; console.error('Falha webhook:',e); }
     }
 
     // 5) Resumo honesto
-    if(!okDados){
-      showToast('Falha ao enviar os dados ao Make.\nO PDF foi baixado. Verifique a URL do webhook e tente novamente.','error');
+    if(!CONFIG.WEBHOOK_URL){
+      showToast('PDF gerado e arquivos na Cloudinary.\n(Webhook do Make não configurado)','success');
+    }else if(!okWebhook){
+      showToast('Arquivos subiram, mas falhou o envio ao Make.\nO PDF foi baixado. Verifique a URL do webhook.','error');
     }else if(falhas.length===0){
-      showToast('✓ Autoavaliação enviada!\nDados + '+okCount+' arquivo(s).','success');
+      showToast('✓ Autoavaliação enviada!\nDados + '+enviados.length+' arquivo(s).','success');
     }else{
-      showToast('Envio parcial: dados ok, '+okCount+' arquivo(s) ok, '+falhas.length+' falhou(aram).\nNão enviados: '+falhas.slice(0,4).join(', ')+(falhas.length>4?'…':'')+'\nO PDF foi baixado — encaminhe os pendentes manualmente.','error');
+      showToast('Envio parcial: '+enviados.length+' arquivo(s) ok, '+falhas.length+' falhou(aram).\nNão enviados: '+falhas.slice(0,4).join(', ')+(falhas.length>4?'…':'')+'\nO PDF foi baixado — encaminhe os pendentes manualmente.','error');
     }
   }catch(e){
     console.error('Erro no envio:',e);
