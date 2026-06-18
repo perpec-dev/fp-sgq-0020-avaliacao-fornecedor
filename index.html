@@ -1071,10 +1071,11 @@ async function enviarLote(arquivos, dadosJSON, prot){
   const fd=new FormData();
   fd.append('protocolo', prot);
   if(dadosJSON) fd.append('dados', dadosJSON);   // só no 1º lote
-  arquivos.forEach((a,idx)=>{
-    // nome de campo previsível p/ o Make: file1, file2... + metadados
-    fd.append('file'+(idx+1), a.file, a.file.name);
-    fd.append('campo'+(idx+1), a.campo);
+  // Mesmo nome de campo repetido ("file"/"campo") → o Make trata como ARRAY,
+  // permitindo um único Iterator no cenário (em vez de file1, file2... soltos).
+  arquivos.forEach(a=>{
+    fd.append('file', a.file, a.file.name);
+    fd.append('campo', a.campo);
   });
   fd.append('qtd_arquivos', String(arquivos.length));
   for(let tent=1; tent<=2; tent++){
