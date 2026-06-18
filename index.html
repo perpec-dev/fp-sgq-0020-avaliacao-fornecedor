@@ -39,7 +39,8 @@
     REGULAR:  75,    // Regular (ou Conforme SEM evidência)
     NC:       0,     // Não Conforme
     PESO_SGQ:     0.5,   // peso do bloco SGQ na nota final
-    PESO_TECNICA: 0.5    // peso do bloco técnico na nota final
+    PESO_TECNICA: 0.5,   // peso do bloco técnico na nota final
+    PISO_CERT_SGQ: 80     // nota final mínima garantida quando há certificado de SGQ válido com evidência anexada (Aprovado sem ressalvas)
   };
 
   // ---- Faixas de classificação (cor + rótulo) -------------------
@@ -276,7 +277,7 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
           <li><strong>Não Conforme (NC):</strong> não existe documentação <strong>e</strong> a prática não é realizada.</li>
           <li><strong>Não Aplicável:</strong> o requisito não se aplica ao escopo deste fornecimento. Nesse caso é <strong>obrigatório</strong> justificar no campo de comentário, ou referenciar a evidência apresentada na pasta indicada abaixo.</li>
         </ul>
-        <p style="margin-top:10px"><strong>Importante:</strong> respostas marcadas como “Conforme” sem evidência comentada (no campo de observações) ou apresentada na pasta de evidências serão automaticamente reclassificadas como <strong>“Regular”</strong> na pontuação final.</p>
+        <p style="margin-top:10px"><strong>Importante:</strong> respostas marcadas como “Conforme” devem ter a evidência comentada (no campo de observações) ou apresentada na pasta de evidências. A nota informada é provisória — a Perpec poderá conferir as evidências e ajustar a classificação de qualquer item durante a auditoria.</p>
       </div>
     </div>
   </div>
@@ -788,6 +789,7 @@ function toggleCert(){
   const sim=document.getElementById('cert_sim').checked;
   document.getElementById('certUploadWrap').style.display=sim?'block':'none';
   if(!sim){arquivoCert=null;renderCertUpload();}
+  atualizar();
 }
 
 /* ================================================================
@@ -938,21 +940,21 @@ function ensure(id){if(!respostas[id])respostas[id]={status:'',comentario:''};re
 function setStatus(id,v){ensure(id).status=v;atualizarQ(id);atualizar();}
 function setCom(id,v){ensure(id).comentario=v;atualizarQ(id);atualizar();}
 
-/* avaliação efetiva de uma pergunta (aplica regra de evidência comentada e N/A) */
+/* avaliação efetiva de uma pergunta (aplica regra de N/A; "Conforme" vale nota cheia
+   independente de evidência comentada — a conferência da evidência é feita depois,
+   na auditoria, sem alterar a pontuação aqui). */
 function efetivo(id){
   const r=respostas[id]; if(!r||!r.status) return null;
   const temComentario=!!(r.comentario&&r.comentario.trim());
-  if(r.status==='Não Aplicável') return {status:'Não Aplicável',pts:null,reclass:false,na:true,pendenteJustificativa:!temComentario};
-  if(r.status==='Conforme'){
-    if(!temComentario) return {status:'Regular',pts:SCORING.REGULAR,reclass:true};
-    return {status:'Conforme',pts:SCORING.CONFORME,reclass:false};
-  }
-  if(r.status==='Regular') return {status:'Regular',pts:SCORING.REGULAR,reclass:false};
-  return {status:'Não Conforme',pts:SCORING.NC,reclass:false};
+  if(r.status==='Não Aplicável') return {status:'Não Aplicável',pts:null,na:true,pendenteJustificativa:!temComentario};
+  if(r.status==='Conforme') return {status:'Conforme',pts:SCORING.CONFORME,semEvidencia:!temComentario};
+  if(r.status==='Regular') return {status:'Regular',pts:SCORING.REGULAR};
+  return {status:'Não Conforme',pts:SCORING.NC};
 }
 
 function atualizarQ(id){
   const e=efetivo(id);
+  const r=respostas[id]||{};
   const score=document.getElementById('score_'+id);
   const warn=document.getElementById('warn_'+id);
   const blk=document.getElementById('blk_'+id);
@@ -968,17 +970,21 @@ function atualizarQ(id){
     return;
   }
   score.textContent=e.pts;
-  score.className='q-score '+(e.pts===100?'c':e.pts===75?'r':'n');
-  if(warn){
-    if(e.reclass){warn.textContent='⚠ Marcado como “Conforme” sem evidência comentada — reclassificado para “Regular” (75 pts) no cálculo.';warn.className='q-warn show';}
-    else{warn.classList.remove('show');warn.textContent='';}
-  }
-  if(blk) blk.className='q-block '+(e.pts===100?'done':e.pts===75?'reg':'nc');
+  // a cor do detalhe segue o status informado pelo fornecedor.
+  score.className='q-score '+(r.status==='Conforme'?'c':r.status==='Regular'?'r':'n');
+  if(warn){ warn.classList.remove('show','err'); warn.textContent=''; }
+  if(blk) blk.className='q-block '+(r.status==='Conforme'?'done':r.status==='Regular'?'reg':'nc');
 }
 
 /* ================================================================
    CÁLCULO + INDICADORES EM TEMPO REAL
    ================================================================ */
+/* Certificação de SGQ válida ("Sim") COM o arquivo do certificado anexado */
+function temCertSGQValidoComEvidencia(){
+  const cert=document.querySelector('input[name="certSGQ"]:checked');
+  return !!(cert && cert.value==='Sim' && arquivoCert);
+}
+
 function calcular(){
   const blocos=blocosVisiveis();
   let sgq=[],tec=[],total=0,respondidas=0;
@@ -991,7 +997,13 @@ function calcular(){
   let nFinal=null;
   if(nSGQ!=null&&nTec!=null) nFinal=SCORING.PESO_SGQ*nSGQ+SCORING.PESO_TECNICA*nTec;
   else if(nSGQ!=null) nFinal=nSGQ; else if(nTec!=null) nFinal=nTec;
-  return {nSGQ,nTec,nFinal,total,respondidas,pct:total?respondidas/total*100:0};
+  // certificação de SGQ válida com evidência garante nota mínima de aprovação sem ressalvas,
+  // independentemente das demais respostas.
+  let certOverride=false;
+  if(nFinal!=null && temCertSGQValidoComEvidencia() && nFinal<SCORING.PISO_CERT_SGQ){
+    nFinal=SCORING.PISO_CERT_SGQ; certOverride=true;
+  }
+  return {nSGQ,nTec,nFinal,total,respondidas,pct:total?respondidas/total*100:0,certOverride};
 }
 
 function atualizar(){
@@ -1022,7 +1034,8 @@ function atualizar(){
   }else{
     rc.style.background=f.bg;rc.style.color=f.cor;rc.style.borderColor=f.cor;
     rc.querySelector('.dot').style.background=f.cor;
-    rct.textContent=f.label+' — '+r.respondidas+'/'+r.total+' respondidas';
+    rct.textContent=f.label+' — '+r.respondidas+'/'+r.total+' respondidas'
+      +(r.certOverride?' (garantida por certificação de SGQ válida com evidência)':'');
   }
 
   // info de anexos (quantidade + tamanho total)
@@ -1079,7 +1092,7 @@ function coletar(){
     const id=qid(b.id,p.c), st=respostas[id]||{}, e=efetivo(id);
     respList.push({bloco:b.id+' - '+b.categoria, bloco_nota:b.bloco_nota, codigo:p.c, texto:p.t,
       status_informado:st.status||'', status_efetivo:e?e.status:'', pontuacao:e?e.pts:null,
-      reclassificado:e?!!e.reclass:false, tem_comentario:!!(st.comentario&&st.comentario.trim()), comentario:st.comentario||''});
+      sem_evidencia_comentada:e?!!e.semEvidencia:false, tem_comentario:!!(st.comentario&&st.comentario.trim()), comentario:st.comentario||''});
   }));
   return {
     protocolo:'RQF-'+protocolo,
@@ -1094,7 +1107,7 @@ function coletar(){
     },
     certificacao_sgq:{ possui: cert?cert.value:'' },
     escopos:escoposSel.slice(),
-    resultados:{ nota_sgq:r.nSGQ, nota_tecnica:r.nTec, nota_final:r.nFinal==null?null:Math.round(r.nFinal*100)/100, classificacao:f.label },
+    resultados:{ nota_sgq:r.nSGQ, nota_tecnica:r.nTec, nota_final:r.nFinal==null?null:Math.round(r.nFinal*100)/100, classificacao:f.label, aprovacao_garantida_por_certificacao_sgq:!!r.certOverride },
     respostas:respList
   };
 }
@@ -1137,6 +1150,7 @@ async function enviar(){
     btn.textContent='⏳ Enviando...';
     const fd=new FormData();
     fd.append('protocolo', dados.protocolo);
+    fd.append('link_pasta_evidencias', linkPastaEvidencias);
     fd.append('dados', dadosStr);
     fd.append('cartao_cnpj', arquivoCNPJ, arquivoCNPJ.name);
     if(arquivoCert) fd.append('certificado_sgq', arquivoCert, arquivoCert.name);
@@ -1238,13 +1252,19 @@ async function gerarPDF(returnBlob){
   doc.setLineWidth(0.5);
   doc.roundedRect(ML,y,CW,11,2,2,'FD');
   doc.setFontSize(11);doc.setFont('helvetica','bold');setC(fc);doc.text('Classificação Final: '+d.resultados.classificacao,W/2,y+7,{align:'center'});
-  y+=16;
+  y+=13;
+  if(d.resultados.aprovacao_garantida_por_certificacao_sgq){
+    doc.setFontSize(7);doc.setFont('helvetica','italic');setC(GRAY);
+    doc.text('* Nota final garantida em '+SCORING.PISO_CERT_SGQ+' pontos devido à certificação de SGQ válida, com evidência apresentada.',ML,y);
+    y+=4;
+  }
+  y+=3;
 
   // ---- Tabelas por bloco ----
   const byBloco={};
   d.respostas.forEach(r=>{(byBloco[r.bloco]=byBloco[r.bloco]||[]).push(r);});
   Object.keys(byBloco).forEach(bk=>{
-    const rows=byBloco[bk].map(r=>[r.codigo,r.texto,r.status_efetivo+(r.reclassificado?' *':''),r.pontuacao==null?(r.status_efetivo==='Não Aplicável'?'N/A':'—'):String(r.pontuacao),r.comentario||'']);
+    const rows=byBloco[bk].map(r=>[r.codigo,r.texto,r.status_efetivo+(r.sem_evidencia_comentada?' *':''),r.pontuacao==null?(r.status_efetivo==='Não Aplicável'?'N/A':'—'):String(r.pontuacao),r.comentario||'']);
     doc.autoTable({
       startY:y+2,margin:{left:ML,right:MR},
       head:[[ {content:bk,colSpan:5,styles:{halign:'left',fillColor:DARK,textColor:[212,200,196],fontSize:7.5}} ],
@@ -1273,10 +1293,10 @@ async function gerarPDF(returnBlob){
     });
     y=doc.lastAutoTable.finalY+3;
   });
-  // legenda reclassificação
+  // legenda — itens marcados como "Conforme" sem evidência comentada, pendentes de conferência na auditoria
   doc.setFontSize(6.5);doc.setFont('helvetica','italic');setC(GRAY);
   if(y>H-16){doc.addPage();y=20;}
-  doc.text('* Reclassificado para “Regular” por ausência de evidência comentada (Conforme sem evidência = 75 pts).',ML,y+3);
+  doc.text('* “Conforme” sem evidência comentada — nota provisória, sujeita a conferência da evidência na auditoria.',ML,y+3);
 
   const tot=doc.internal.getNumberOfPages();for(let i=1;i<=tot;i++){doc.setPage(i);footer();}
   const nome='Autoavaliacao-RQF-'+protocolo+'.pdf';
