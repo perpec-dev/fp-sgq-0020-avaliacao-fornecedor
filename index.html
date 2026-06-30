@@ -24,8 +24,20 @@
     IMG_MAX_PX:  1800,  // redimensiona imagens grandes (maior lado) antes de anexar.
     IMG_QUALITY: 0.72,  // qualidade JPEG da recompressão de imagens.
 
-    // Fontes de dados opcionais no repositório Git. Se ausentes,
-    // o portal usa os bancos embutidos mais abaixo (fallback).
+    // ---- Fonte de dados: Planilha Google (atualiza em tempo real) ----
+    // As perguntas e escopos são lidos diretamente das abas da planilha
+    // abaixo via export CSV (endpoint gviz). Editar a planilha (adicionar,
+    // remover, reescrever) reflete no portal automaticamente, SEM commit.
+    // Requisito: a planilha deve estar compartilhada como "Qualquer pessoa
+    // com o link → Leitor".
+    //   Aba de perguntas: colunas bloco_id, categoria, grupo, bloco_nota, escopo, codigo, texto
+    //   Aba de escopos:   colunas nome, tipo, blocos
+    SHEET_ID:            "1soNX-LdvAit09ja38D3eEFXTEk82oyt_XrhlzJMl05c",
+    SHEET_PERGUNTAS_ABA: "Perguntas",  // nome da aba de perguntas
+    SHEET_ESCOPOS_ABA:   "Escopo",     // nome da aba de escopos
+    SHEET_TEXTOS_ABA:    "Textos",     // aba dos textos de orientação (chave|conteudo)
+
+    // Fontes CSV locais (fallback se a planilha estiver indisponível).
     PERGUNTAS_CSV_URL: "perguntas.csv",
     ESCOPOS_CSV_URL:   "escopo.csv",
     LOGO_URL:          "PERPEC - LOGO PRINCIPAL.png",
@@ -269,7 +281,7 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
       <h2>Como Responder este Questionário</h2>
     </div>
     <div class="card-body">
-      <div class="lgpd-note">
+      <div class="lgpd-note" id="txtComoResponder">
         Para cada item do questionário, classifique a situação real do fornecedor:
         <ul>
           <li><strong>Conforme (OK):</strong> existe documentação formal <strong>e</strong> a prática é efetivamente realizada.</li>
@@ -289,7 +301,7 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
       <h2>Pasta de Evidências</h2>
     </div>
     <div class="card-body">
-      <p class="lgpd-note">Envie todos os documentos comprobatórios (certificados, procedimentos, registros, fotos etc.) referentes às respostas deste questionário para a pasta abaixo, fornecida pela Perpec especificamente para este fornecedor.</p>
+      <div class="lgpd-note" id="txtEvidencias"><p>Envie todos os documentos comprobatórios (certificados, procedimentos, registros, fotos etc.) referentes às respostas deste questionário para a pasta abaixo, fornecida pela Perpec especificamente para este fornecedor.</p></div>
       <div id="pastaEvidWrap" style="margin-top:12px"></div>
     </div>
   </div>
@@ -301,7 +313,7 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
       <h2>Aviso de Privacidade e LGPD</h2>
     </div>
     <div class="card-body">
-      <div class="lgpd-note">
+      <div class="lgpd-note" id="txtLGPD">
         Antes de iniciar o preenchimento, leia atentamente:
         <ul>
           <li>Todos os documentos enviados serão armazenados de forma segura.</li>
@@ -695,6 +707,7 @@ window.onload = async () => {
   carregarLinkPasta();
   await carregarEscoposExternos();
   await carregarPerguntasExternas();
+  await carregarTextosExternos();
   BANCO_PERGUNTAS.forEach(b=>blocosMap[b.id]=b);
   renderCNPJUpload(); renderCertUpload();
   renderEscopos(); renderPerguntas(); atualizar();
@@ -735,39 +748,151 @@ function renderPastaEvid(){
     : '<div class="q-warn show">⚠ Nenhuma pasta de evidências foi vinculada a este link. Solicite à Perpec o link correto de acesso.</div>';
 }
 
-/* ----- carga opcional de CSV externos (sobrepõe o fallback) ----- */
-async function carregarEscoposExternos(){
-  if(!CONFIG.ESCOPOS_CSV_URL) return;
-  try{
-    const txt=await (await fetch(CONFIG.ESCOPOS_CSV_URL)).text();
-    // colunas: nome;tipo;blocos(separados por vírgula)
-    const linhas=txt.split('\n').map(l=>l.trim()).filter(Boolean);
-    const out=[];
-    linhas.forEach((l,i)=>{
-      const c=l.split(';'); if(i===0 && /nome/i.test(c[0])) return;
-      const nome=(c[0]||'').trim(); if(!nome) return;
-      out.push({nome, tipo:((c[1]||'produto').trim().toLowerCase()==='servico'?'servico':'produto'),
-                blocos:(c[2]||'').split(',').map(x=>x.trim()).filter(Boolean)});
-    });
-    if(out.length) ESCOPOS=out;
-  }catch(e){/* mantém fallback */}
+/* ----- carga de dados externos (Planilha Google → fallback CSV local) -----
+
+   Fonte primária: abas da Planilha Google (export CSV via endpoint gviz),
+   o que permite editar perguntas/escopos sem novo commit no Git.
+   Se a planilha falhar (offline, sem permissão), tenta o CSV local;
+   se ambos falharem, mantém o banco embutido (fallback final).            */
+
+/* URL de export CSV de uma aba da planilha. cache-busting (&_) evita
+   que o navegador sirva uma versão antiga em cache. */
+function urlSheetCSV(aba){
+  if(!CONFIG.SHEET_ID) return null;
+  return 'https://docs.google.com/spreadsheets/d/'+CONFIG.SHEET_ID
+       + '/gviz/tq?tqx=out:csv&sheet='+encodeURIComponent(aba)
+       + '&_='+Date.now();
 }
+
+/* Parser de CSV robusto (RFC 4180): lida com aspas, vírgulas dentro de
+   células e quebras de linha. Detecta automaticamente o separador (',' do
+   Google Sheets ou ';' dos CSVs locais). Retorna matriz de linhas/células. */
+function parseCSV(text){
+  text=String(text||'').replace(/^﻿/,'');            // remove BOM
+  // separador: ';' só se houver mais ';' que ',' na 1ª linha (CSV local pt-BR)
+  const head=(text.split('\n')[0]||'');
+  const sep=( (head.split(';').length-1) > (head.split(',').length-1) ) ? ';' : ',';
+  const rows=[]; let row=[], val='', q=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i];
+    if(q){
+      if(ch==='"'){ if(text[i+1]==='"'){val+='"';i++;} else q=false; }
+      else val+=ch;
+    }else{
+      if(ch==='"') q=true;
+      else if(ch===sep){ row.push(val); val=''; }
+      else if(ch==='\n'){ row.push(val); rows.push(row); row=[]; val=''; }
+      else if(ch==='\r'){ /* ignora */ }
+      else val+=ch;
+    }
+  }
+  if(val!==''||row.length){ row.push(val); rows.push(row); }
+  return rows.filter(r=>r.some(c=>String(c).trim()!==''));   // descarta linhas vazias
+}
+
+/* Busca a 1ª fonte que retornar conteúdo válido. */
+async function fetchTextoPrimeiroOk(urls){
+  for(const u of urls){
+    if(!u) continue;
+    try{
+      const r=await fetch(u,{cache:'no-store'});
+      if(!r.ok) continue;
+      const t=await r.text();
+      if(t && t.trim()) return t;
+    }catch(e){/* tenta a próxima fonte */}
+  }
+  return null;
+}
+
+async function carregarEscoposExternos(){
+  const txt=await fetchTextoPrimeiroOk([urlSheetCSV(CONFIG.SHEET_ESCOPOS_ABA), CONFIG.ESCOPOS_CSV_URL]);
+  if(!txt) return;                                   // mantém fallback embutido
+  // colunas: nome | tipo | blocos (blocos separados por vírgula)
+  const rows=parseCSV(txt);
+  const out=[];
+  rows.forEach((c,i)=>{
+    if(i===0 && /nome/i.test(c[0]||'')) return;       // pula cabeçalho
+    const nome=(c[0]||'').trim(); if(!nome) return;
+    out.push({nome,
+              tipo:((c[1]||'produto').trim().toLowerCase()==='servico'?'servico':'produto'),
+              blocos:(c[2]||'').split(',').map(x=>x.trim()).filter(Boolean)});
+  });
+  if(out.length) ESCOPOS=out;
+}
+
 async function carregarPerguntasExternas(){
-  if(!CONFIG.PERGUNTAS_CSV_URL) return;
-  try{
-    const txt=await (await fetch(CONFIG.PERGUNTAS_CSV_URL)).text();
-    // colunas: bloco_id;categoria;grupo;bloco_nota;escopo;codigo;texto
-    const linhas=txt.split('\n').map(l=>l.replace(/\r$/,'')).filter(l=>l.trim());
-    const mapa={};
-    linhas.forEach((l,i)=>{
-      const c=l.split(';'); if(i===0 && /bloco_id/i.test(c[0])) return;
-      const id=(c[0]||'').trim(); if(!id) return;
-      if(!mapa[id]) mapa[id]={id,categoria:(c[1]||'').trim(),grupo:(c[2]||'ESCOPO').trim(),bloco_nota:(c[3]||'TECNICA').trim(),perguntas:[]};
-      mapa[id].perguntas.push({c:(c[5]||'').trim(),t:(c[6]||'').trim()});
-    });
-    const arr=Object.values(mapa);
-    if(arr.length){BANCO_PERGUNTAS.length=0;arr.forEach(b=>BANCO_PERGUNTAS.push(b));}
-  }catch(e){/* mantém fallback */}
+  const txt=await fetchTextoPrimeiroOk([urlSheetCSV(CONFIG.SHEET_PERGUNTAS_ABA), CONFIG.PERGUNTAS_CSV_URL]);
+  if(!txt) return;                                   // mantém fallback embutido
+  // colunas: bloco_id | categoria | grupo | bloco_nota | escopo | codigo | texto
+  const rows=parseCSV(txt);
+  const mapa={}; const ordem=[];
+  rows.forEach((c,i)=>{
+    if(i===0 && /bloco_id/i.test(c[0]||'')) return;   // pula cabeçalho
+    const id=(c[0]||'').trim(); if(!id) return;
+    const cod=(c[5]||'').trim(), texto=(c[6]||'').trim();
+    if(!cod && !texto) return;                         // ignora linhas sem pergunta
+    if(!mapa[id]){
+      mapa[id]={id,categoria:(c[1]||'').trim(),grupo:(c[2]||'ESCOPO').trim(),
+                bloco_nota:(c[3]||'TECNICA').trim(),perguntas:[]};
+      ordem.push(id);
+    }
+    mapa[id].perguntas.push({c:cod,t:texto});
+  });
+  const arr=ordem.map(id=>mapa[id]);
+  if(arr.length){BANCO_PERGUNTAS.length=0;arr.forEach(b=>BANCO_PERGUNTAS.push(b));}
+}
+
+/* ----- Textos de orientação (aba "Textos" da planilha) -------------
+   Permite editar, sem commit, os blocos de texto das seções:
+   "Como Responder", "Pasta de Evidências" e "Aviso LGPD".
+   Estrutura da aba (2 colunas):
+     chave    | conteudo
+     como_responder | (texto do bloco)
+     evidencias     | (texto do bloco)
+     lgpd           | (texto do bloco)
+   No conteúdo aceita um mini-Markdown:
+     **negrito**            -> negrito
+     linhas iniciadas por "- " ou "* "  -> itens de lista
+     linha em branco        -> novo parágrafo
+   (Na célula do Google Sheets, use Alt+Enter para quebrar linha.)      */
+const TEXTOS_MAP = {                  // chave da planilha -> id do elemento na página
+  como_responder: 'txtComoResponder',
+  evidencias:     'txtEvidencias',
+  lgpd:           'txtLGPD'
+};
+
+/* Converte mini-Markdown em HTML seguro (escapa antes de formatar). */
+function miniMarkdown(txt){
+  const linhas=String(txt||'').replace(/\r/g,'').split('\n');
+  const html=[]; let emLista=false;
+  const fechaLista=()=>{ if(emLista){html.push('</ul>');emLista=false;} };
+  const inline=s=>esc(s).replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  linhas.forEach(l=>{
+    const t=l.trim();
+    if(!t){ fechaLista(); return; }                 // linha vazia separa blocos
+    if(/^[-*]\s+/.test(t)){
+      if(!emLista){html.push('<ul>');emLista=true;}
+      html.push('<li>'+inline(t.replace(/^[-*]\s+/,''))+'</li>');
+    }else{
+      fechaLista();
+      html.push('<p>'+inline(t)+'</p>');
+    }
+  });
+  fechaLista();
+  return html.join('');
+}
+
+async function carregarTextosExternos(){
+  const txt=await fetchTextoPrimeiroOk([urlSheetCSV(CONFIG.SHEET_TEXTOS_ABA)]);
+  if(!txt) return;                                  // mantém os textos padrão do HTML
+  const rows=parseCSV(txt);
+  rows.forEach((c,i)=>{
+    const chave=(c[0]||'').trim().toLowerCase();
+    if(i===0 && /chave/i.test(chave)) return;        // pula cabeçalho
+    const id=TEXTOS_MAP[chave]; if(!id) return;
+    const conteudo=(c[1]||'').trim(); if(!conteudo) return;
+    const el=document.getElementById(id); if(el) el.innerHTML=miniMarkdown(conteudo);
+  });
 }
 
 function carregarLogo(){
