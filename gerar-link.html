@@ -30,6 +30,18 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
 .field label{font-size:11.5px;font-weight:600;color:var(--muted);letter-spacing:.02em}
 .field input{border:1px solid var(--border2);border-radius:var(--radius);padding:9px 11px;font-size:14px;font-family:inherit;color:var(--text);background:var(--surface);width:100%}
 .field input:focus{outline:none;border-color:var(--red);box-shadow:0 0 0 3px rgba(192,57,43,.12)}
+.req{color:var(--red);margin-left:1px}
+.escopo-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}
+@media(max-width:480px){.escopo-grid{grid-template-columns:1fr}}
+.escopo-chip{display:flex;align-items:center;gap:9px;padding:10px 13px;border:1px solid var(--border2);border-radius:var(--radius);cursor:pointer;background:var(--surface);transition:border-color .13s,background .13s;font-size:13px}
+.escopo-chip:hover{border-color:#9A9087;background:var(--surface2)}
+.escopo-chip input{width:17px;height:17px;accent-color:var(--red);cursor:pointer;flex-shrink:0}
+.escopo-chip.sel{border-color:var(--red);background:var(--accent-lt)}
+.escopo-chip .esc-name{font-weight:600;color:var(--text)}
+.escopo-chip .esc-tag{font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:2px 7px;border-radius:20px;margin-left:auto}
+.esc-tag.produto{background:#EEF2FF;color:#3D5AC0}
+.esc-tag.servico{background:#F1ECE6;color:#8A6D3B}
+.escopo-loading{font-size:13px;color:var(--muted);font-style:italic;padding:4px 0}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:9px 16px;border:none;border-radius:var(--radius);font-size:13px;font-weight:600;cursor:pointer;transition:all .13s;font-family:inherit}
 .btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.15)}
 .btn-red{background:var(--red);color:#fff}.btn-red:hover{background:var(--red2)}
@@ -66,8 +78,17 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
         <input type="text" id="nomeFornecedor" placeholder="Ex.: Indústria Metal Sul Ltda">
       </div>
       <div class="field">
-        <label>Link da Pasta de Evidências deste Fornecedor</label>
+        <label>Número de Rastreabilidade <span class="req">*</span></label>
+        <input type="text" id="rasField" placeholder="Ex.: RQF-247-26">
+      </div>
+      <div class="field">
+        <label>Link da Pasta de Evidências deste Fornecedor <span class="req">*</span></label>
         <input type="text" id="linkPasta" placeholder="Cole aqui o link da pasta (Monday, Drive etc.)">
+      </div>
+      <div class="field" style="margin-bottom:18px">
+        <label>Escopo(s) do Fornecedor <span class="req">*</span></label>
+        <div class="escopo-loading" id="escopoLoading">Carregando escopos da planilha…</div>
+        <div class="escopo-grid" id="escopoGridGerador"></div>
       </div>
       <button class="btn btn-red" onclick="gerar()">Gerar Link do Formulário</button>
 
@@ -79,27 +100,105 @@ body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(
           <button class="btn btn-red" onclick="copiar()">Copiar</button>
         </div>
         <div class="copied" id="copiedMsg">✓ Link copiado para a área de transferência</div>
-        <p class="hint">Envie este link por e-mail ao fornecedor. Ao abrir, o formulário já estará vinculado à pasta de evidências dele.</p>
+        <p class="hint">Envie este link por e-mail ao fornecedor. Ao abrir, o formulário já estará vinculado à pasta de evidências e ao(s) escopo(s) selecionado(s) — sem necessidade de seleção manual pelo fornecedor.</p>
       </div>
     </div>
   </div>
 </main>
 
 <script>
+const SHEET_ID          = '1soNX-LdvAit09ja38D3eEFXTEk82oyt_XrhlzJMl05c';
+const SHEET_ESCOPOS_ABA = 'Escopo';
+
+let escoposGerador = [];   // lista de {nome, tipo} carregada da planilha
+let selGerador     = [];   // nomes selecionados pelo operador
+
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+/* Parser CSV robusto — idêntico ao de index.html (RFC 4180) */
+function parseCSV(text){
+  text=String(text||'').replace(/^﻿/,'');
+  const head=(text.split('\n')[0]||'');
+  const sep=((head.split(';').length-1)>(head.split(',').length-1))?';':',';
+  const rows=[]; let row=[],val='',q=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i];
+    if(q){
+      if(ch==='"'){if(text[i+1]==='"'){val+='"';i++;}else q=false;}
+      else val+=ch;
+    }else{
+      if(ch==='"') q=true;
+      else if(ch===sep){row.push(val);val='';}
+      else if(ch==='\n'){row.push(val);rows.push(row);row=[];val='';}
+      else if(ch==='\r'){/* ignora */}
+      else val+=ch;
+    }
+  }
+  if(val!==''||row.length){row.push(val);rows.push(row);}
+  return rows.filter(r=>r.some(c=>String(c).trim()!==''));
+}
+
+window.onload = async () => { await carregarEscoposGerador(); };
+
+async function carregarEscoposGerador(){
+  const loading = document.getElementById('escopoLoading');
+  const url = 'https://docs.google.com/spreadsheets/d/'+SHEET_ID
+            + '/gviz/tq?tqx=out:csv&sheet='+encodeURIComponent(SHEET_ESCOPOS_ABA)
+            + '&_='+Date.now();
+  try{
+    const r = await fetch(url, {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const rows = parseCSV(await r.text());
+    escoposGerador = [];
+    rows.forEach((c,i)=>{
+      if(i===0 && /nome/i.test(c[0]||'')) return;
+      const nome=(c[0]||'').trim(); if(!nome) return;
+      escoposGerador.push({nome, tipo:((c[1]||'').trim().toLowerCase()==='servico'?'servico':'produto')});
+    });
+    loading.style.display = 'none';
+    renderEscoposGerador();
+  }catch(e){
+    loading.textContent = 'Não foi possível carregar os escopos da planilha. Verifique a conexão.';
+  }
+}
+
+function renderEscoposGerador(){
+  const grid = document.getElementById('escopoGridGerador');
+  grid.innerHTML = escoposGerador.map((e,i)=>{
+    const sel = selGerador.includes(e.nome);
+    return '<label class="escopo-chip'+(sel?' sel':'')+'" id="gchip_'+i+'">'
+      +'<input type="checkbox" '+(sel?'checked':'')+' onchange="toggleGeradorEscopo('+i+',this.checked)">'
+      +'<span class="esc-name">'+esc(e.nome)+'</span>'
+      +'<span class="esc-tag '+e.tipo+'">'+(e.tipo==='produto'?'Produto':'Serviço')+'</span></label>';
+  }).join('');
+}
+
+function toggleGeradorEscopo(i, checked){
+  const nome = escoposGerador[i].nome;
+  if(checked){ if(!selGerador.includes(nome)) selGerador.push(nome); }
+  else{ selGerador = selGerador.filter(x=>x!==nome); }
+  document.getElementById('gchip_'+i).classList.toggle('sel', checked);
+}
+
 function basePath(){
-  // mesma pasta deste arquivo, troca gerar-link.html por index.html
   return window.location.href.replace(/gerar-link\.html.*$/,'index.html');
 }
+
 function gerar(){
-  const pasta=document.getElementById('linkPasta').value.trim();
-  if(!pasta){ alert('Cole o link da pasta de evidências do fornecedor.'); return; }
-  const url=basePath()+'?pasta='+encodeURIComponent(pasta);
-  document.getElementById('linkGerado').value=url;
+  const pasta = document.getElementById('linkPasta').value.trim();
+  const ras   = document.getElementById('rasField').value.trim();
+  if(!ras)   { alert('Informe o número de rastreabilidade.'); return; }
+  if(!pasta) { alert('Cole o link da pasta de evidências do fornecedor.'); return; }
+  if(!selGerador.length){ alert('Selecione ao menos um escopo de fornecimento.'); return; }
+  const params = new URLSearchParams({pasta, ras, escopos: selGerador.join('|')});
+  const url = basePath()+'?'+params.toString();
+  document.getElementById('linkGerado').value = url;
   document.getElementById('resultWrap').classList.add('show');
   document.getElementById('copiedMsg').classList.remove('show');
 }
+
 function copiar(){
-  const inp=document.getElementById('linkGerado');
+  const inp = document.getElementById('linkGerado');
   inp.select(); inp.setSelectionRange(0,99999);
   navigator.clipboard && navigator.clipboard.writeText(inp.value);
   document.getElementById('copiedMsg').classList.add('show');
